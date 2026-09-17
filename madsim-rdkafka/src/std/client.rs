@@ -19,6 +19,7 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::slice;
 use std::string::ToString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use libc::addrinfo;
@@ -173,12 +174,27 @@ impl ClientContext for DefaultClientContext {}
 /// higher level `Client` or producers and consumers.
 // TODO(benesch): this should be `pub(crate)`.
 pub struct NativeClient {
-    ptr: NativePtr<RDKafka>,
+    // Destroyed by `Drop for NativeClient`, which passes destroy flags.
+    ptr: ManuallyDrop<NativePtr<RDKafka>>,
+    no_consumer_close: AtomicBool,
 }
 
 unsafe impl KafkaDrop for RDKafka {
     const TYPE: &'static str = "client";
     const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_destroy;
+}
+
+impl Drop for NativeClient {
+    fn drop(&mut self) {
+        let flags = if self.no_consumer_close.load(Ordering::Relaxed) {
+            rdsys::RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE
+        } else {
+            0
+        };
+        trace!("Destroying client: {:?}", self.ptr());
+        unsafe { rdsys::rd_kafka_destroy_flags(self.ptr(), flags) }
+        trace!("Destroyed client: {:?}", self.ptr());
+    }
 }
 
 // The library is completely thread safe, according to the documentation.
@@ -189,8 +205,18 @@ impl NativeClient {
     /// Wraps a pointer to an RDKafka object and returns a new NativeClient.
     pub(crate) unsafe fn from_ptr(ptr: *mut RDKafka) -> NativeClient {
         NativeClient {
-            ptr: NativePtr::from_ptr(ptr).unwrap(),
+            ptr: ManuallyDrop::new(NativePtr::from_ptr(ptr).unwrap()),
+            no_consumer_close: AtomicBool::new(false),
         }
+    }
+
+    /// Destroys this client with `RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE`.
+    pub(crate) fn set_no_consumer_close_on_drop(&self) {
+        self.no_consumer_close.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn no_consumer_close_on_drop(&self) -> bool {
+        self.no_consumer_close.load(Ordering::Relaxed)
     }
 
     /// Returns the wrapped pointer to RDKafka.

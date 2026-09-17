@@ -258,6 +258,17 @@ where
     fn base(&self) -> &BaseConsumer<C> {
         self.base.as_ref().expect("consumer already closed")
     }
+
+    /// Destroys the client with `RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE` when this consumer is
+    /// dropped, so that dropping it skips the LeaveGroup request, the final offset commit and the
+    /// rebalance callbacks, and therefore does not wait on the group coordinator.
+    ///
+    /// Intended for consumers that [`assign`](Consumer::assign) their partitions and do not rely on
+    /// committed offsets. Offset commits that are already in flight are still awaited by
+    /// librdkafka.
+    pub fn set_no_consumer_close_on_drop(&self) {
+        self.base().set_no_consumer_close_on_drop();
+    }
 }
 
 impl<C, R> StreamConsumer<C, R>
@@ -587,6 +598,11 @@ where
 
 async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) {
     let start = std::time::Instant::now();
+    if base.no_consumer_close_on_drop() {
+        let _ = tokio::task::spawn_blocking(move || drop(base)).await;
+        info!("stream consumer closed in {:?}", start.elapsed());
+        return;
+    }
     match base.close_queue() {
         Ok(()) => {
             let mut backoff = Duration::from_millis(1);

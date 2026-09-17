@@ -365,6 +365,9 @@ impl<C> BaseConsumer<C>
 where
     C: ConsumerContext,
 {
+    /// Skips the consumer close when this consumer is dropped. No-op in simulation.
+    pub fn set_no_consumer_close_on_drop(&self) {}
+
     /// Polls the consumer for new messages.
     pub async fn poll(
         &self,
@@ -520,6 +523,9 @@ impl<C> StreamConsumer<C>
 where
     C: ConsumerContext,
 {
+    /// Skips the consumer close when this consumer is dropped. No-op in simulation.
+    pub fn set_no_consumer_close_on_drop(&self) {}
+
     /// Constructs a stream that yields messages from this consumer.
     pub fn stream(&self) -> MessageStream<'_, C> {
         MessageStream {

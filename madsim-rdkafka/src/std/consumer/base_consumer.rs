@@ -170,6 +170,21 @@ where
         unsafe { rdsys::rd_kafka_consumer_closed(self.client.native_ptr()) == 1 }
     }
 
+    /// Destroys the client with `RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE` when this consumer is
+    /// dropped, so that dropping it skips the LeaveGroup request, the final offset commit and the
+    /// rebalance callbacks, and therefore does not wait on the group coordinator.
+    ///
+    /// Intended for consumers that [`assign`](Consumer::assign) their partitions and do not rely on
+    /// committed offsets. Offset commits that are already in flight are still awaited by
+    /// librdkafka.
+    pub fn set_no_consumer_close_on_drop(&self) {
+        self.client.native_client().set_no_consumer_close_on_drop();
+    }
+
+    pub(crate) fn no_consumer_close_on_drop(&self) -> bool {
+        self.client.native_client().no_consumer_close_on_drop()
+    }
+
     /// Polls the consumer for new messages.
     ///
     /// It won't block for more than the specified timeout. Use zero `Duration` for non-blocking
@@ -674,7 +689,11 @@ where
 {
     fn drop(&mut self) {
         trace!("Destroying consumer: {:?}", self.client.native_ptr()); // TODO: fix me (multiple executions ?)
-        unsafe { rdsys::rd_kafka_consumer_close(self.client.native_ptr()) };
+
+        // When the close is skipped, `rd_kafka_destroy_flags` performs a non-waiting one itself.
+        if !self.no_consumer_close_on_drop() {
+            unsafe { rdsys::rd_kafka_consumer_close(self.client.native_ptr()) };
+        }
         trace!("Consumer destroyed: {:?}", self.client.native_ptr());
     }
 }
