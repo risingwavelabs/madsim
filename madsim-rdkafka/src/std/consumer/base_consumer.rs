@@ -145,6 +145,31 @@ where
         }
     }
 
+    /// Initiates a graceful close of the consumer, without waiting for it to finish.
+    ///
+    /// Poll the consumer until [`closed`](Self::closed) returns true to drive the close forward.
+    pub fn close_queue(&self) -> KafkaResult<()> {
+        let queue = self.client.consumer_queue().ok_or_else(|| {
+            KafkaError::ClientCreation("librdkafka failed to create consumer queue".into())
+        })?;
+        let err = unsafe {
+            RDKafkaError::from_ptr(rdsys::rd_kafka_consumer_close_queue(
+                self.client.native_ptr(),
+                queue.ptr(),
+            ))
+        };
+        if err.is_error() {
+            Err(KafkaError::ConsumerQueueClose(err.code()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns true if the consumer is closed, else false.
+    pub fn closed(&self) -> bool {
+        unsafe { rdsys::rd_kafka_consumer_closed(self.client.native_ptr()) == 1 }
+    }
+
     /// Polls the consumer for new messages.
     ///
     /// It won't block for more than the specified timeout. Use zero `Duration` for non-blocking

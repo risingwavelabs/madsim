@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use crate::log::trace;
+use crate::log::{error, info, trace};
 use futures_channel::oneshot;
 use futures_util::future::{self, Either, FutureExt};
 use futures_util::pin_mut;
@@ -166,7 +166,8 @@ where
     C: ConsumerContext,
 {
     queue: NativeQueue, // queue must be dropped before the base to avoid deadlock
-    base: BaseConsumer<C>,
+    // `None` once `Drop` has handed the base consumer off to the close task.
+    base: Option<BaseConsumer<C>>,
     wakers: Arc<WakerSlab>,
     _shutdown_trigger: oneshot::Sender<()>,
     _runtime: PhantomData<R>,
@@ -241,12 +242,21 @@ where
         });
 
         Ok(StreamConsumer {
-            base,
+            base: Some(base),
             wakers,
             queue,
             _shutdown_trigger: shutdown_trigger,
             _runtime: PhantomData,
         })
+    }
+}
+
+impl<C, R> StreamConsumer<C, R>
+where
+    C: ConsumerContext,
+{
+    fn base(&self) -> &BaseConsumer<C> {
+        self.base.as_ref().expect("consumer already closed")
     }
 }
 
@@ -342,7 +352,7 @@ where
         };
         let queue = unsafe {
             NativeQueue::from_ptr(rdsys::rd_kafka_queue_get_partition(
-                self.base.client().native_ptr(),
+                self.base().client().native_ptr(),
                 topic.as_ptr(),
                 partition,
             ))
@@ -369,39 +379,39 @@ where
     R: AsyncRuntime,
 {
     fn client(&self) -> &Client<C> {
-        self.base.client()
+        self.base().client()
     }
 
     fn group_metadata(&self) -> Option<ConsumerGroupMetadata> {
-        self.base.group_metadata()
+        self.base().group_metadata()
     }
 
     fn subscribe(&self, topics: &[&str]) -> KafkaResult<()> {
-        self.base.subscribe(topics)
+        self.base().subscribe(topics)
     }
 
     fn unsubscribe(&self) {
-        self.base.unsubscribe();
+        self.base().unsubscribe();
     }
 
     fn assign(&self, assignment: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.assign(assignment)
+        self.base().assign(assignment)
     }
 
     fn unassign(&self) -> KafkaResult<()> {
-        self.base.unassign()
+        self.base().unassign()
     }
 
     fn incremental_assign(&self, assignment: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.incremental_assign(assignment)
+        self.base().incremental_assign(assignment)
     }
 
     fn incremental_unassign(&self, assignment: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.incremental_unassign(assignment)
+        self.base().incremental_unassign(assignment)
     }
 
     fn assignment_lost(&self) -> bool {
-        self.base.assignment_lost()
+        self.base().assignment_lost()
     }
 
     async fn seek<T: Into<Timeout> + Send>(
@@ -411,7 +421,7 @@ where
         offset: Offset,
         timeout: T,
     ) -> KafkaResult<()> {
-        self.base.seek(topic, partition, offset, timeout).await
+        self.base().seek(topic, partition, offset, timeout).await
     }
 
     async fn seek_partitions<T: Into<Timeout> + Send>(
@@ -419,7 +429,7 @@ where
         topic_partition_list: TopicPartitionList,
         timeout: T,
     ) -> KafkaResult<TopicPartitionList> {
-        self.base
+        self.base()
             .seek_partitions(topic_partition_list, timeout)
             .await
     }
@@ -429,11 +439,11 @@ where
         topic_partition_list: &TopicPartitionList,
         mode: CommitMode,
     ) -> KafkaResult<()> {
-        self.base.commit(topic_partition_list, mode).await
+        self.base().commit(topic_partition_list, mode).await
     }
 
     async fn commit_consumer_state(&self, mode: CommitMode) -> KafkaResult<()> {
-        self.base.commit_consumer_state(mode).await
+        self.base().commit_consumer_state(mode).await
     }
 
     async fn commit_message(
@@ -441,27 +451,27 @@ where
         message: &BorrowedMessage<'_>,
         mode: CommitMode,
     ) -> KafkaResult<()> {
-        self.base.commit_message(message, mode).await
+        self.base().commit_message(message, mode).await
     }
 
     fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> KafkaResult<()> {
-        self.base.store_offset(topic, partition, offset)
+        self.base().store_offset(topic, partition, offset)
     }
 
     fn store_offset_from_message(&self, message: &BorrowedMessage<'_>) -> KafkaResult<()> {
-        self.base.store_offset_from_message(message)
+        self.base().store_offset_from_message(message)
     }
 
     fn store_offsets(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.store_offsets(tpl)
+        self.base().store_offsets(tpl)
     }
 
     fn subscription(&self) -> KafkaResult<TopicPartitionList> {
-        self.base.subscription()
+        self.base().subscription()
     }
 
     fn assignment(&self) -> KafkaResult<TopicPartitionList> {
-        self.base.assignment()
+        self.base().assignment()
     }
 
     async fn committed<T>(&self, timeout: T) -> KafkaResult<TopicPartitionList>
@@ -469,7 +479,7 @@ where
         T: Into<Timeout> + Send,
         Self: Sized,
     {
-        self.base.committed(timeout).await
+        self.base().committed(timeout).await
     }
 
     async fn committed_offsets<T>(
@@ -480,7 +490,7 @@ where
     where
         T: Into<Timeout> + Send,
     {
-        self.base.committed_offsets(tpl, timeout).await
+        self.base().committed_offsets(tpl, timeout).await
     }
 
     async fn offsets_for_timestamp<T>(
@@ -492,7 +502,7 @@ where
         T: Into<Timeout> + Send,
         Self: Sized,
     {
-        self.base.offsets_for_timestamp(timestamp, timeout).await
+        self.base().offsets_for_timestamp(timestamp, timeout).await
     }
 
     async fn offsets_for_times<T>(
@@ -504,11 +514,11 @@ where
         T: Into<Timeout> + Send,
         Self: Sized,
     {
-        self.base.offsets_for_times(timestamps, timeout).await
+        self.base().offsets_for_times(timestamps, timeout).await
     }
 
     fn position(&self) -> KafkaResult<TopicPartitionList> {
-        self.base.position()
+        self.base().position()
     }
 
     async fn fetch_metadata<T>(&self, topic: Option<&str>, timeout: T) -> KafkaResult<Metadata>
@@ -516,7 +526,7 @@ where
         T: Into<Timeout> + Send,
         Self: Sized,
     {
-        self.base.fetch_metadata(topic, timeout).await
+        self.base().fetch_metadata(topic, timeout).await
     }
 
     async fn fetch_watermarks<T>(
@@ -529,7 +539,9 @@ where
         T: Into<Timeout> + Send + 'static,
         Self: Sized,
     {
-        self.base.fetch_watermarks(topic, partition, timeout).await
+        self.base()
+            .fetch_watermarks(topic, partition, timeout)
+            .await
     }
 
     async fn fetch_group_list<T>(&self, group: Option<&str>, timeout: T) -> KafkaResult<GroupList>
@@ -537,20 +549,59 @@ where
         T: Into<Timeout> + Send,
         Self: Sized,
     {
-        self.base.fetch_group_list(group, timeout).await
+        self.base().fetch_group_list(group, timeout).await
     }
 
     fn pause(&self, partitions: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.pause(partitions)
+        self.base().pause(partitions)
     }
 
     fn resume(&self, partitions: &TopicPartitionList) -> KafkaResult<()> {
-        self.base.resume(partitions)
+        self.base().resume(partitions)
     }
 
     fn rebalance_protocol(&self) -> RebalanceProtocol {
-        self.base.rebalance_protocol()
+        self.base().rebalance_protocol()
     }
+}
+
+impl<C, R> Drop for StreamConsumer<C, R>
+where
+    C: ConsumerContext + 'static,
+{
+    fn drop(&mut self) {
+        // The queue callback must not fire into `wakers` while the consumer is closing.
+        unsafe { disable_nonempty_callback(&self.queue) }
+        let Some(base) = self.base.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Closing waits on the group coordinator, so never do it on the caller's thread.
+            Ok(handle) => {
+                handle.spawn(close_and_destroy(base));
+            }
+            Err(_) => drop(base),
+        }
+    }
+}
+
+async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) {
+    let start = std::time::Instant::now();
+    match base.close_queue() {
+        Ok(()) => {
+            let mut backoff = Duration::from_millis(1);
+            while !base.closed() {
+                // Serve rebalance callbacks and close events posted to the consumer queue.
+                let _ = base.poll(Duration::ZERO);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(100));
+            }
+        }
+        Err(e) => error!("failed to start closing stream consumer: {}", e),
+    }
+    // `rd_kafka_destroy` still joins librdkafka's native threads.
+    let _ = tokio::task::spawn_blocking(move || drop(base)).await;
+    info!("stream consumer closed in {:?}", start.elapsed());
 }
 
 /// A message queue for a single partition of a [`StreamConsumer`].
