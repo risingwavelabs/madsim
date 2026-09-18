@@ -596,6 +596,8 @@ where
     }
 }
 
+const MAX_DRAIN_PER_TICK: usize = 1024;
+
 async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) {
     let start = std::time::Instant::now();
     if base.no_consumer_close_on_drop() {
@@ -603,12 +605,19 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
         info!("stream consumer closed in {:?}", start.elapsed());
         return;
     }
+    let mut discarded = 0;
     match base.close_queue() {
         Ok(()) => {
             let mut backoff = Duration::from_millis(1);
             while !base.closed() {
-                // Serve rebalance callbacks and close events posted to the consumer queue.
-                let _ = base.poll(Duration::ZERO);
+                // `BaseConsumer::poll` also serves the main queue, which librdkafka forbids
+                // once `rd_kafka_poll_set_consumer` has redirected it into this queue.
+                let n = drain_consumer_queue(&base, MAX_DRAIN_PER_TICK);
+                discarded += n;
+                if n == MAX_DRAIN_PER_TICK {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(100));
             }
@@ -617,7 +626,23 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
     }
     // `rd_kafka_destroy` still joins librdkafka's native threads.
     let _ = tokio::task::spawn_blocking(move || drop(base)).await;
-    info!("stream consumer closed in {:?}", start.elapsed());
+    info!(
+        "stream consumer closed in {:?}, {} fetched messages discarded",
+        start.elapsed(),
+        discarded
+    );
+}
+
+/// Serves the consumer queue without touching the main queue, discarding messages that were
+/// fetched but never delivered. Returns how many were discarded.
+fn drain_consumer_queue<C: ConsumerContext>(base: &BaseConsumer<C>, max: usize) -> usize {
+    let ptr = base.client().native_ptr();
+    for n in 0..max {
+        if unsafe { NativePtr::from_ptr(rdsys::rd_kafka_consumer_poll(ptr, 0)) }.is_none() {
+            return n;
+        }
+    }
+    max
 }
 
 /// A message queue for a single partition of a [`StreamConsumer`].
