@@ -26,7 +26,7 @@ use crate::consumer::{
     CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, DefaultConsumerContext,
     RebalanceProtocol,
 };
-use crate::error::{KafkaError, KafkaResult};
+use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::groups::GroupList;
 use crate::message::BorrowedMessage;
 use crate::metadata::Metadata;
@@ -612,9 +612,9 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
             while !base.closed() {
                 // `BaseConsumer::poll` also serves the main queue, which librdkafka forbids
                 // once `rd_kafka_poll_set_consumer` has redirected it into this queue.
-                let n = drain_consumer_queue(&base, MAX_DRAIN_PER_TICK);
-                discarded += n;
-                if n == MAX_DRAIN_PER_TICK {
+                let (served, messages) = drain_consumer_queue(&base, MAX_DRAIN_PER_TICK);
+                discarded += messages;
+                if served == MAX_DRAIN_PER_TICK {
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -633,16 +633,22 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
     );
 }
 
-/// Serves the consumer queue without touching the main queue, discarding messages that were
-/// fetched but never delivered. Returns how many were discarded.
-fn drain_consumer_queue<C: ConsumerContext>(base: &BaseConsumer<C>, max: usize) -> usize {
+/// Serves the consumer queue without touching the main queue, discarding what it returns: messages
+/// that were fetched but never delivered, and consumer errors such as `PARTITION_EOF`. Returns how
+/// many items were served and how many of them were messages.
+fn drain_consumer_queue<C: ConsumerContext>(base: &BaseConsumer<C>, max: usize) -> (usize, usize) {
     let ptr = base.client().native_ptr();
-    for n in 0..max {
-        if unsafe { NativePtr::from_ptr(rdsys::rd_kafka_consumer_poll(ptr, 0)) }.is_none() {
-            return n;
+    let mut messages = 0;
+    for served in 0..max {
+        let Some(item) = (unsafe { NativePtr::from_ptr(rdsys::rd_kafka_consumer_poll(ptr, 0)) })
+        else {
+            return (served, messages);
+        };
+        if !item.err.is_error() {
+            messages += 1;
         }
     }
-    max
+    (max, messages)
 }
 
 /// A message queue for a single partition of a [`StreamConsumer`].
