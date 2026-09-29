@@ -26,7 +26,7 @@ use crate::consumer::{
     CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, DefaultConsumerContext,
     RebalanceProtocol,
 };
-use crate::error::{KafkaError, KafkaResult};
+use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::groups::GroupList;
 use crate::message::BorrowedMessage;
 use crate::metadata::Metadata;
@@ -596,6 +596,8 @@ where
     }
 }
 
+const MAX_DRAIN_PER_TICK: usize = 1024;
+
 async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) {
     let start = std::time::Instant::now();
     if base.no_consumer_close_on_drop() {
@@ -603,12 +605,19 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
         info!("stream consumer closed in {:?}", start.elapsed());
         return;
     }
+    let mut discarded = 0;
     match base.close_queue() {
         Ok(()) => {
             let mut backoff = Duration::from_millis(1);
             while !base.closed() {
-                // Serve rebalance callbacks and close events posted to the consumer queue.
-                let _ = base.poll(Duration::ZERO);
+                // `BaseConsumer::poll` also serves the main queue, which librdkafka forbids
+                // once `rd_kafka_poll_set_consumer` has redirected it into this queue.
+                let (served, messages) = drain_consumer_queue(&base, MAX_DRAIN_PER_TICK);
+                discarded += messages;
+                if served == MAX_DRAIN_PER_TICK {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(100));
             }
@@ -617,7 +626,29 @@ async fn close_and_destroy<C: ConsumerContext + 'static>(base: BaseConsumer<C>) 
     }
     // `rd_kafka_destroy` still joins librdkafka's native threads.
     let _ = tokio::task::spawn_blocking(move || drop(base)).await;
-    info!("stream consumer closed in {:?}", start.elapsed());
+    info!(
+        "stream consumer closed in {:?}, {} fetched messages discarded",
+        start.elapsed(),
+        discarded
+    );
+}
+
+/// Serves the consumer queue without touching the main queue, discarding what it returns: messages
+/// that were fetched but never delivered, and consumer errors such as `PARTITION_EOF`. Returns how
+/// many items were served and how many of them were messages.
+fn drain_consumer_queue<C: ConsumerContext>(base: &BaseConsumer<C>, max: usize) -> (usize, usize) {
+    let ptr = base.client().native_ptr();
+    let mut messages = 0;
+    for served in 0..max {
+        let Some(item) = (unsafe { NativePtr::from_ptr(rdsys::rd_kafka_consumer_poll(ptr, 0)) })
+        else {
+            return (served, messages);
+        };
+        if !item.err.is_error() {
+            messages += 1;
+        }
+    }
+    (max, messages)
 }
 
 /// A message queue for a single partition of a [`StreamConsumer`].
